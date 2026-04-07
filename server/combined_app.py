@@ -229,17 +229,10 @@ with gr.Blocks(title="Email Triage OpenEnv") as demo:
     reset_btn.click(reset_ui, [task_dd], [inbox_html, metrics_txt, history_html, email_dd, status_txt])
     action_btn.click(take_action_ui, [email_dd, action_dd, cat_dd, pri_dd, reply_txt], [inbox_html, metrics_txt, history_html, email_dd, status_txt])
     
-    gr.Markdown("---\n**API:** `/reset`, `/step`, `/state`, `/tasks`, `/health`")
+    gr.Markdown("---\n**API:** `/health`, `/tasks`, `/reset`, `/step`, `/state`")
 
-# Mount Gradio on FastAPI at /ui path (API at root)
-app = gr.mount_gradio_app(fastapi_app, demo, path="/ui")
-
-# Add redirect from root to UI
-from fastapi.responses import RedirectResponse
-
-@fastapi_app.get("/")
-def root():
-    return RedirectResponse(url="/ui")
+# Mount Gradio at root for HF Spaces App tab compatibility
+app = gr.mount_gradio_app(fastapi_app, demo, path="/")
 
 if __name__ == "__main__":
     import uvicorn
