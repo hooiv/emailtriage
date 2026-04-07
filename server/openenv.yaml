@@ -1,0 +1,159 @@
+# Email Triage OpenEnv
+name: email-triage
+version: 1.0.0
+description: >
+  An OpenEnv-compliant environment for email triage tasks.
+  Agents must categorize, prioritize, and take appropriate actions on incoming emails.
+  This simulates a real-world task that knowledge workers perform daily.
+
+# Environment metadata
+author: OpenEnv Challenge Participant
+license: MIT
+tags:
+  - openenv
+  - email
+  - triage
+  - nlp
+  - real-world
+
+# API specification
+api:
+  base_url: /
+  endpoints:
+    reset:
+      method: POST
+      path: /reset
+      request_model: ResetRequest
+      response_model: ResetResult
+    step:
+      method: POST
+      path: /step
+      request_model: Action
+      response_model: StepResult
+    state:
+      method: GET
+      path: /state
+      response_model: State
+    tasks:
+      method: GET
+      path: /tasks
+      response_model: TaskListResponse
+
+# Model definitions
+models:
+  observation:
+    type: Observation
+    fields:
+      - name: inbox
+        type: List[Email]
+        description: Current state of the inbox
+      - name: current_email_id
+        type: Optional[str]
+        description: Currently focused email
+      - name: step_count
+        type: int
+        description: Current step number
+      - name: max_steps
+        type: int
+        description: Maximum steps allowed
+      - name: task_description
+        type: str
+        description: Description of the current task
+      - name: available_actions
+        type: List[str]
+        description: List of valid action types
+      - name: last_action_result
+        type: Optional[str]
+        description: Result of last action
+      - name: last_action_error
+        type: Optional[str]
+        description: Error from last action if any
+
+  action:
+    type: Action
+    fields:
+      - name: action_type
+        type: ActionType
+        required: true
+        description: Type of action to perform
+        enum: [categorize, prioritize, reply, forward, archive, flag, mark_spam, done]
+      - name: email_id
+        type: Optional[str]
+        description: Target email ID
+      - name: category
+        type: Optional[EmailCategory]
+        description: Category for categorize action
+        enum: [customer_support, sales, billing, technical, spam, internal, newsletter]
+      - name: priority
+        type: Optional[EmailPriority]
+        description: Priority for prioritize action
+        enum: [urgent, high, normal, low]
+      - name: reply_content
+        type: Optional[str]
+        description: Content for reply action
+      - name: forward_to
+        type: Optional[str]
+        description: Email address for forward action
+
+  reward:
+    type: Reward
+    fields:
+      - name: value
+        type: float
+        description: Reward value between -1.0 and 1.0
+        range: [-1.0, 1.0]
+      - name: breakdown
+        type: Dict[str, float]
+        description: Detailed breakdown of reward components
+      - name: message
+        type: str
+        description: Human-readable explanation
+
+# Tasks
+tasks:
+  - id: task_easy_categorize
+    name: Basic Email Categorization
+    difficulty: easy
+    description: Categorize 5 emails into their correct categories
+    max_steps: 20
+    success_criteria:
+      min_categorization_accuracy: 0.6
+      spam_detection_required: true
+
+  - id: task_medium_triage
+    name: Email Triage with Prioritization
+    difficulty: medium
+    description: Triage 10 emails with categorization, prioritization, and actions
+    max_steps: 40
+    success_criteria:
+      min_categorization_accuracy: 0.7
+      min_prioritization_accuracy: 0.6
+      customer_support_replied: true
+
+  - id: task_hard_full_inbox
+    name: Full Inbox Management
+    difficulty: hard
+    description: Manage 15 emails with full triage workflow
+    max_steps: 60
+    success_criteria:
+      min_categorization_accuracy: 0.8
+      min_prioritization_accuracy: 0.7
+      spam_detection_accuracy: 0.9
+      efficiency_bonus: true
+
+# Grading
+grading:
+  score_range: [0.0, 1.0]
+  passing_threshold: 0.6
+  metrics:
+    - categorization_accuracy
+    - prioritization_accuracy
+    - spam_detection_accuracy
+    - customer_support_replied
+    - efficiency_bonus
+
+# Resource requirements
+resources:
+  vcpu: 2
+  memory_gb: 8
+  inference_timeout_minutes: 20

@@ -1,0 +1,977 @@
+"""FastAPI server for Email Triage OpenEnv environment."""
+
+import os
+import time
+import logging
+from datetime import datetime
+from typing import Any, Dict, Optional
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+from environment import EmailTriageEnv
+from models import (
+    Action, State, StepResult, ResetResult, 
+    HealthResponse, ErrorResponse, EnvironmentMetrics
+)
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("email-triage-env")
+
+# Server start time for uptime tracking
+SERVER_START_TIME = time.time()
+
+# Request metrics
+request_count = 0
+total_response_time = 0.0
+
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup/shutdown events."""
+    logger.info("Email Triage OpenEnv server starting...")
+    yield
+    logger.info("Email Triage OpenEnv server shutting down...")
+
+
+# Create FastAPI app
+app = FastAPI(
+    title="Email Triage OpenEnv",
+    description="""
+    An OpenEnv-compliant environment for email triage tasks.
+    
+    ## Features
+    - Email conversation threading
+    - SLA tracking with time-based urgency
+    - Sender reputation system
+    - Smart action suggestions
+    - Batch action processing
+    - Comprehensive metrics
+    - State persistence (save/restore)
+    
+    ## Tasks
+    - **Easy**: Basic email categorization (5 emails)
+    - **Medium**: Triage with prioritization (10 emails)
+    - **Hard**: Full inbox management with threading (15 emails)
+    
+    ## Rate Limits
+    - 100 requests per minute for API endpoints
+    - Health checks are unlimited
+    """,
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# Add rate limiter
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Request timing middleware
+@app.middleware("http")
+async def add_timing_header(request: Request, call_next):
+    """Add timing information to responses."""
+    global request_count, total_response_time
+    
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    
+    request_count += 1
+    total_response_time += process_time
+    
+    response.headers["X-Process-Time"] = f"{process_time:.4f}"
+    response.headers["X-Request-ID"] = f"{request_count}"
+    
+    # Log request
+    logger.info(
+        f"{request.method} {request.url.path} - {response.status_code} - {process_time:.4f}s"
+    )
+    
+    return response
+
+
+# Global environment instance
+env: Optional[EmailTriageEnv] = None
+
+
+class ResetRequest(BaseModel):
+    """Request body for reset endpoint."""
+    task_id: Optional[str] = None
+
+
+class TaskListResponse(BaseModel):
+    """Response for list_tasks endpoint."""
+    tasks: list
+
+
+class MetricsResponse(BaseModel):
+    """Server-level metrics response."""
+    uptime_seconds: float
+    total_requests: int
+    avg_response_time_ms: float
+    environment_initialized: bool
+    current_task: Optional[str]
+    episode_metrics: Optional[EnvironmentMetrics]
+
+
+class RestoreRequest(BaseModel):
+    """Request model for /restore endpoint."""
+    state: Dict[str, Any]
+
+
+@app.get("/", response_model=HealthResponse)
+async def root():
+    """Health check endpoint with server info."""
+    return HealthResponse(
+        status="healthy",
+        version="1.0.0",
+        uptime_seconds=time.time() - SERVER_START_TIME,
+        environment="email-triage"
+    )
+
+
+@app.get("/health", response_model=HealthResponse)
+async def health():
+    """Health check endpoint - always returns healthy if server is running."""
+    return HealthResponse(
+        status="healthy",
+        version="1.0.0",
+        uptime_seconds=time.time() - SERVER_START_TIME,
+        environment="email-triage"
+    )
+
+
+@app.get("/ready")
+async def ready():
+    """
+    Readiness check endpoint.
+    
+    Returns 200 if server is ready to accept requests.
+    Returns 503 if server is not ready.
+    
+    For Kubernetes/container orchestration.
+    """
+    # Server is always ready once it starts
+    return {"status": "ready", "uptime_seconds": time.time() - SERVER_START_TIME}
+
+
+@app.get("/metrics", response_model=MetricsResponse)
+async def metrics():
+    """Get server and environment metrics."""
+    global request_count, total_response_time
+    
+    avg_time = (total_response_time / request_count * 1000) if request_count > 0 else 0.0
+    
+    return MetricsResponse(
+        uptime_seconds=time.time() - SERVER_START_TIME,
+        total_requests=request_count,
+        avg_response_time_ms=avg_time,
+        environment_initialized=env is not None and env._initialized,
+        current_task=env.task_id if env else None,
+        episode_metrics=env.metrics if env and env._initialized else None
+    )
+
+
+@app.post("/reset", response_model=ResetResult)
+@limiter.limit("100/minute")
+async def reset(request: Request, body: ResetRequest = ResetRequest()):
+    """
+    Reset the environment to initial state.
+    
+    Optionally specify a task_id to switch tasks.
+    
+    Available tasks:
+    - task_easy_categorize: Basic categorization (5 emails)
+    - task_medium_triage: Triage with prioritization (10 emails)
+    - task_hard_full_inbox: Full inbox management (15 emails)
+    """
+    global env
+    
+    task_id = body.task_id or "task_easy_categorize"
+    
+    try:
+        env = EmailTriageEnv(task_id=task_id)
+        result = env.reset()
+        logger.info(f"Environment reset with task: {task_id}")
+        return result
+    except ValueError as e:
+        logger.error(f"Reset failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Reset failed with unexpected error")
+        raise HTTPException(status_code=500, detail=f"Reset failed: {str(e)}")
+
+
+@app.post("/step", response_model=StepResult)
+@limiter.limit("100/minute")
+async def step(request: Request, action: Action):
+    """
+    Execute an action in the environment.
+    
+    Returns observation, reward, done flag, and info.
+    
+    Available actions:
+    - categorize: Assign category to email
+    - prioritize: Set priority level
+    - reply: Send reply
+    - forward: Forward to address
+    - archive: Archive email
+    - flag: Flag as important
+    - mark_spam: Mark as spam
+    - snooze: Snooze email
+    - batch: Process multiple actions
+    - done: End episode
+    """
+    global env
+    
+    if env is None:
+        raise HTTPException(
+            status_code=400, 
+            detail="Environment not initialized. Call /reset first."
+        )
+    
+    try:
+        result = env.step(action)
+        
+        if result.done:
+            logger.info(
+                f"Episode completed - Score: {result.info.get('final_score', 0):.3f}"
+            )
+        
+        return result
+    except RuntimeError as e:
+        logger.warning(f"Step failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Step failed with unexpected error")
+        raise HTTPException(status_code=500, detail=f"Step failed: {str(e)}")
+
+
+@app.get("/state", response_model=State)
+async def state():
+    """
+    Get the current state of the environment.
+    
+    Includes full inbox, thread summaries, metrics, and ground truth.
+    """
+    global env
+    
+    if env is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Environment not initialized. Call /reset first."
+        )
+    
+    try:
+        return env.state()
+    except Exception as e:
+        logger.exception("State retrieval failed")
+        raise HTTPException(status_code=500, detail=f"State failed: {str(e)}")
+
+
+@app.get("/tasks", response_model=TaskListResponse)
+async def list_tasks():
+    """List all available tasks with their configurations."""
+    temp_env = EmailTriageEnv()
+    return TaskListResponse(tasks=temp_env.get_available_tasks())
+
+
+@app.get("/task/{task_id}")
+async def get_task(task_id: str):
+    """Get details for a specific task."""
+    temp_env = EmailTriageEnv()
+    tasks = temp_env.get_available_tasks()
+    
+    for task in tasks:
+        if task["task_id"] == task_id:
+            return task
+    
+    raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+
+
+@app.get("/threads")
+async def get_threads():
+    """Get all email thread summaries."""
+    global env
+    
+    if env is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Environment not initialized. Call /reset first."
+        )
+    
+    return {"threads": [t.model_dump() for t in env.thread_manager.get_all_summaries()]}
+
+
+@app.get("/thread/{thread_id}")
+async def get_thread(thread_id: str):
+    """Get all emails in a specific thread."""
+    global env
+    
+    if env is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Environment not initialized. Call /reset first."
+        )
+    
+    emails = env.thread_manager.get_thread(thread_id)
+    if not emails:
+        raise HTTPException(status_code=404, detail=f"Thread not found: {thread_id}")
+    
+    return {"thread_id": thread_id, "emails": [e.model_dump() for e in emails]}
+
+
+@app.get("/recommendations")
+async def get_recommendations():
+    """Get smart action recommendations based on current state."""
+    global env
+    
+    if env is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Environment not initialized. Call /reset first."
+        )
+    
+    recommendations = env._generate_recommendations()
+    return {"recommendations": recommendations}
+
+
+@app.post("/save")
+async def save_state():
+    """
+    Save the current environment state to a JSON-serializable format.
+    
+    Useful for checkpointing and reproducibility.
+    
+    Returns:
+        state_data: Complete environment state that can be restored
+    """
+    global env
+    
+    if env is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Environment not initialized. Call /reset first."
+        )
+    
+    try:
+        state = env.state()
+        state_data = {
+            "task_id": env.task_id,
+            "step_count": env.step_count,
+            "total_reward": env.total_reward,
+            "done": env.done,
+            "emails": [e.model_dump() for e in env.emails],
+            "ground_truth": env.ground_truth,
+            "action_history": env.action_history,
+            "metrics": env.metrics.model_dump(),
+            "timestamp": datetime.now().isoformat()
+        }
+        logger.info("Environment state saved")
+        return {"state": state_data}
+    except Exception as e:
+        logger.exception("Save state failed")
+        raise HTTPException(status_code=500, detail=f"Save failed: {str(e)}")
+
+
+@app.post("/restore")
+async def restore_state(state_data: RestoreRequest):
+    """
+    Restore environment state from saved data.
+    
+    This is useful for:
+    - Resuming interrupted sessions
+    - Reproducing specific scenarios
+    - Testing edge cases
+    
+    Args:
+        state_data: State data from /save endpoint
+    """
+    global env
+    
+    try:
+        # Create new environment with same task
+        payload = state_data.state
+        task_id = payload.get("task_id", "task_easy_categorize")
+        env = EmailTriageEnv(task_id=task_id)
+        
+        # Restore the state manually
+        inner_state = payload
+        env.step_count = inner_state.get("step_count", 0)
+        env.total_reward = inner_state.get("total_reward", 0.0)
+        env.done = inner_state.get("done", False)
+        env.action_history = inner_state.get("action_history", [])
+        env._initialized = True
+        
+        # Restore emails
+        from models import Email, EnvironmentMetrics
+        if "emails" in inner_state:
+            env.emails = [Email(**e) for e in inner_state["emails"]]
+            env.ground_truth = inner_state.get("ground_truth", {})
+        
+        # Restore metrics
+        if "metrics" in inner_state:
+            env.metrics = EnvironmentMetrics(**inner_state["metrics"])
+
+        # Rebuild thread manager
+        for email in env.emails:
+            env.thread_manager.add_email(email)
+        env.current_email_id = env.emails[0].id if env.emails else None
+
+        logger.info(f"Environment state restored - task: {task_id}, step: {env.step_count}")
+        return {"status": "restored", "task_id": task_id, "step_count": env.step_count}
+    except Exception as e:
+        logger.exception("Restore state failed")
+        raise HTTPException(status_code=400, detail=f"Restore failed: {str(e)}")
+
+
+@app.get("/search")
+@limiter.limit("100/minute")
+async def search_emails(
+    request: Request,
+    query: Optional[str] = None,
+    sender: Optional[str] = None,
+    category: Optional[str] = None,
+    priority: Optional[str] = None,
+    is_spam: Optional[bool] = None,
+    is_read: Optional[bool] = None,
+    has_attachments: Optional[bool] = None
+):
+    """
+    Search and filter emails based on various criteria.
+    
+    Query parameters:
+    - query: Search in subject and body
+    - sender: Filter by sender email
+    - category: Filter by category
+    - priority: Filter by priority
+    - is_spam: Filter spam emails
+    - is_read: Filter read/unread emails
+    - has_attachments: Filter emails with attachments
+    """
+    if not env._initialized:
+        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+    
+    results = []
+    for email in env.emails:
+        # Apply filters
+        if query and query.lower() not in email.subject.lower() and query.lower() not in email.body.lower():
+            continue
+        if sender and sender.lower() not in email.sender.lower():
+            continue
+        if category and email.category != category:
+            continue
+        if priority and email.priority != priority:
+            continue
+        if is_spam is not None and email.is_spam != is_spam:
+            continue
+        if is_read is not None and email.is_read != is_read:
+            continue
+        if has_attachments is not None and email.has_attachments != has_attachments:
+            continue
+        
+        results.append(email)
+    
+    return {
+        "count": len(results),
+        "results": results
+    }
+
+
+@app.get("/analytics")
+@limiter.limit("100/minute")
+async def get_analytics(request: Request):
+    """
+    Get analytics dashboard data about email distribution and performance.
+    """
+    if not env._initialized:
+        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+    
+    from collections import Counter
+    from models import EmailCategory, EmailPriority
+    
+    # Category distribution
+    category_dist = Counter(email.category.value if email.category else 'uncategorized' for email in env.emails)
+    
+    # Priority distribution
+    priority_dist = Counter(email.priority.value if email.priority else 'unset' for email in env.emails)
+    
+    # Status metrics
+    total_emails = len(env.emails)
+    unread_emails = sum(1 for e in env.emails if not e.is_read)
+    spam_emails = sum(1 for e in env.emails if e.is_spam)
+    flagged_emails = sum(1 for e in env.emails if e.is_flagged)
+    archived_emails = sum(1 for e in env.emails if e.is_archived)
+    
+    # Attachment stats
+    with_attachments = sum(1 for e in env.emails if e.has_attachments)
+    
+    # Sentiment distribution
+    sentiment_dist = Counter(email.sentiment_label for email in env.emails if email.sentiment_label)
+    
+    # SLA status
+    sla_at_risk = sum(1 for e in env.emails if e.sla_deadline and e.time_in_inbox_hours and 
+                     e.time_in_inbox_hours >= (24 * 0.8))  # 80% of SLA deadline
+    
+    # Response metrics
+    replied_emails = sum(1 for e in env.emails if e.reply_sent)
+    forwarded_emails = sum(1 for e in env.emails if e.forwarded_to)
+    
+    # Thread stats
+    threads = env.thread_manager.get_all_summaries()
+    thread_sizes = [t.email_count for t in threads]
+    avg_thread_size = sum(thread_sizes) / len(thread_sizes) if thread_sizes else 0
+    
+    return {
+        "overview": {
+            "total_emails": total_emails,
+            "unread": unread_emails,
+            "spam": spam_emails,
+            "flagged": flagged_emails,
+            "archived": archived_emails,
+            "with_attachments": with_attachments
+        },
+        "distribution": {
+            "by_category": dict(category_dist),
+            "by_priority": dict(priority_dist),
+            "by_sentiment": dict(sentiment_dist)
+        },
+        "activity": {
+            "replied": replied_emails,
+            "forwarded": forwarded_emails,
+            "processing_rate": f"{(total_emails - unread_emails) / total_emails * 100:.1f}%" if total_emails > 0 else "0%"
+        },
+        "threads": {
+            "total_threads": len(threads),
+            "average_thread_size": round(avg_thread_size, 2)
+        },
+        "sla": {
+            "at_risk": sla_at_risk,
+            "compliance_rate": f"{(1 - sla_at_risk / total_emails) * 100:.1f}%" if total_emails > 0 else "100%"
+        }
+    }
+
+
+@app.get("/export")
+@limiter.limit("50/minute")
+async def export_emails(
+    request: Request,
+    format: str = "json",
+    include_body: bool = False
+):
+    """
+    Export emails in JSON or CSV format.
+    
+    Query parameters:
+    - format: 'json' or 'csv' (default: json)
+    - include_body: Include email body in export (default: false)
+    """
+    if not env._initialized:
+        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+    
+    if format == "csv":
+        import io
+        import csv
+        
+        output = io.StringIO()
+        fields = ['id', 'sender', 'sender_name', 'subject', 'category', 'priority', 
+                 'is_spam', 'is_read', 'is_flagged', 'is_archived', 'has_attachments',
+                 'sentiment_score', 'sentiment_label', 'time_in_inbox_hours']
+        if include_body:
+            fields.append('body')
+        
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+        
+        for email in env.emails:
+            row = {
+                'id': email.id,
+                'sender': email.sender,
+                'sender_name': email.sender_name,
+                'subject': email.subject,
+                'category': email.category.value if email.category else '',
+                'priority': email.priority.value if email.priority else '',
+                'is_spam': email.is_spam,
+                'is_read': email.is_read,
+                'is_flagged': email.is_flagged,
+                'is_archived': email.is_archived,
+                'has_attachments': email.has_attachments,
+                'sentiment_score': email.sentiment_score or 0,
+                'sentiment_label': email.sentiment_label or '',
+                'time_in_inbox_hours': email.time_in_inbox_hours or 0
+            }
+            if include_body:
+                row['body'] = email.body
+            writer.writerow(row)
+        
+        csv_content = output.getvalue()
+        return Response(
+            content=csv_content,
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=emails_export.csv"}
+        )
+    
+    else:  # JSON format
+        export_data = []
+        for email in env.emails:
+            email_dict = email.model_dump()
+            if not include_body:
+                email_dict.pop('body', None)
+            export_data.append(email_dict)
+        
+        return {
+            "format": "json",
+            "count": len(export_data),
+            "timestamp": datetime.utcnow().isoformat(),
+            "emails": export_data
+        }
+
+
+@app.get("/audit-log")
+@limiter.limit("100/minute")
+async def get_audit_log(request: Request, limit: int = 100):
+    """
+    Get audit log entries for compliance and debugging.
+    
+    Query parameters:
+    - limit: Maximum number of entries to return (default: 100, max: 1000)
+    """
+    if not env._initialized:
+        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+    
+    limit = min(limit, 1000)  # Cap at 1000
+    recent_entries = env.audit_log[-limit:] if len(env.audit_log) > limit else env.audit_log
+    
+    return {
+        "audit_log": recent_entries,
+        "total_entries": len(env.audit_log),
+        "returned_entries": len(recent_entries)
+    }
+
+
+@app.get("/canned-responses")
+@limiter.limit("100/minute")
+async def get_canned_responses(request: Request, category: Optional[str] = None):
+    """
+    Get available canned response templates.
+    
+    Query parameters:
+    - category: Filter by email category
+    """
+    from email_threading import CANNED_RESPONSES
+    
+    responses = list(CANNED_RESPONSES.values())
+    
+    if category:
+        responses = [r for r in responses if r.get('category') == category]
+    
+    return {
+        "canned_responses": responses,
+        "count": len(responses)
+    }
+
+
+@app.post("/filters")
+@limiter.limit("50/minute")
+async def save_filter(request: Request, filter_data: dict):
+    """
+    Save a custom email filter.
+    
+    Body should contain:
+    - name: Filter name
+    - query: Text search query (optional)
+    - category: Category filter (optional) 
+    - priority: Priority filter (optional)
+    - tags: Tag filters (optional)
+    - other filter criteria...
+    """
+    if not env._initialized:
+        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+    
+    if "name" not in filter_data:
+        raise HTTPException(status_code=400, detail="Filter name is required")
+    
+    filter_id = filter_data["name"].lower().replace(" ", "_")
+    filter_data["id"] = filter_id
+    filter_data["created_at"] = datetime.utcnow().isoformat()
+    
+    env.saved_filters[filter_id] = filter_data
+    
+    return {
+        "status": "saved",
+        "filter_id": filter_id,
+        "filter_data": filter_data
+    }
+
+
+@app.get("/filters")
+@limiter.limit("100/minute")
+async def get_saved_filters(request: Request):
+    """Get all saved email filters."""
+    if not env._initialized:
+        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+    
+    return {
+        "saved_filters": list(env.saved_filters.values()),
+        "count": len(env.saved_filters)
+    }
+
+
+@app.get("/tags")
+@limiter.limit("100/minute")
+async def get_all_tags(request: Request):
+    """Get all tags used in the current session."""
+    if not env._initialized:
+        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+    
+    # Collect all tags from emails
+    all_tags = set()
+    for email in env.emails:
+        if email.tags:
+            all_tags.update(email.tags)
+    
+    # Also include tags from saved filters
+    all_tags.update(env.tags_used)
+    
+    return {
+        "tags": sorted(list(all_tags)),
+        "count": len(all_tags)
+    }
+
+
+@app.get("/importance-distribution")
+@limiter.limit("100/minute")
+async def get_importance_distribution(request: Request):
+    """Get distribution of email importance scores."""
+    if not env._initialized:
+        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+    
+    scores = [email.importance_score for email in env.emails]
+    
+    # Create distribution buckets
+    buckets = {
+        "critical": len([s for s in scores if s >= 80]),
+        "high": len([s for s in scores if 60 <= s < 80]),
+        "medium": len([s for s in scores if 40 <= s < 60]),
+        "low": len([s for s in scores if s < 40])
+    }
+    
+    avg_score = sum(scores) / len(scores) if scores else 0
+    
+    return {
+        "distribution": buckets,
+        "average_score": round(avg_score, 2),
+        "total_emails": len(scores),
+        "score_range": {"min": min(scores), "max": max(scores)} if scores else {"min": 0, "max": 0}
+    }
+
+
+# Exception handler for validation errors
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler."""
+    logger.exception(f"Unhandled exception: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content=ErrorResponse(
+            error="internal_server_error",
+            message=str(exc),
+            details={"path": str(request.url)}
+        ).model_dump()
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 7860))
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        log_level="info",
+        access_log=True
+    )
+
+
+@app.get("/email-rules")
+@limiter.limit("100/minute") 
+async def get_email_rules(request: Request):
+    """Get all AI-generated email automation rules."""
+    if not env._initialized:
+        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+    
+    return {
+        "rules": [rule.model_dump() for rule in env.email_rules],
+        "active_count": sum(1 for r in env.email_rules if r.is_active),
+        "total_applications": sum(r.applications_count for r in env.email_rules)
+    }
+
+
+@app.post("/email-rules/{rule_id}/toggle")
+@limiter.limit("50/minute")
+async def toggle_email_rule(request: Request, rule_id: str):
+    """Toggle an email rule active/inactive."""
+    if not env._initialized:
+        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+    
+    rule = next((r for r in env.email_rules if r.id == rule_id), None)
+    if not rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    
+    rule.is_active = not rule.is_active
+    
+    env._add_audit_log("rule_toggled", None, {
+        "rule_id": rule_id,
+        "rule_name": rule.name,
+        "new_status": "active" if rule.is_active else "inactive"
+    })
+    
+    return {
+        "success": True,
+        "rule_id": rule_id,
+        "is_active": rule.is_active
+    }
+
+
+@app.get("/performance")
+@limiter.limit("100/minute")
+async def get_performance_metrics(request: Request):
+    """Get real-time performance metrics and optimization suggestions."""
+    if not env._initialized:
+        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+    
+    import psutil
+    import os
+    
+    # Get system metrics
+    process = psutil.Process(os.getpid())
+    env.performance_metrics.cpu_usage_percent = process.cpu_percent()
+    env.performance_metrics.memory_usage_mb = process.memory_info().rss / 1024 / 1024
+    
+    # Calculate API calls per minute
+    current_time = time.time()
+    recent_requests = len([t for t in env._request_times if current_time - t < 60])
+    env.performance_metrics.api_calls_per_minute = recent_requests
+    
+    return {
+        "performance": env.performance_metrics.model_dump(),
+        "uptime_seconds": current_time - env._start_time,
+        "total_requests": env.metrics.total_requests
+    }
+
+
+@app.get("/team-members")
+@limiter.limit("100/minute")
+async def get_team_members(request: Request):
+    """Get all team members."""
+    if not env._initialized:
+        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+    
+    return {
+        "members": [member.model_dump() for member in env.team_members.values()],
+        "count": len(env.team_members)
+    }
+
+
+@app.post("/team-members")
+@limiter.limit("20/minute")
+async def add_team_member(request: Request, member_data: dict):
+    """Add a new team member."""
+    if not env._initialized:
+        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+    
+    try:
+        member_id = env.add_team_member(
+            name=member_data["name"],
+            email=member_data["email"],
+            role=member_data.get("role", "agent")
+        )
+        
+        return {
+            "success": True,
+            "member_id": member_id,
+            "message": f"Team member {member_data[\"name\"]} added"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to add team member: {str(e)}")
+
+
+@app.get("/analytics/summary")
+@limiter.limit("100/minute")
+async def get_analytics_summary(request: Request):
+    """Get comprehensive analytics summary."""
+    if not env._initialized:
+        raise HTTPException(status_code=400, detail="Environment not initialized. Call /reset first.")
+    
+    # Email statistics
+    total_emails = len(env.emails)
+    processed_emails = sum(1 for e in env.emails if e.category is not None)
+    spam_emails = sum(1 for e in env.emails if e.is_spam)
+    flagged_emails = sum(1 for e in env.emails if e.is_flagged)
+    
+    # Response statistics
+    replied_emails = sum(1 for e in env.emails if e.reply_sent)
+    forwarded_emails = sum(1 for e in env.emails if e.forwarded_to)
+    
+    # Time statistics
+    avg_processing_time = env.metrics.avg_response_time_ms
+    
+    # Rule statistics
+    active_rules = sum(1 for r in env.email_rules if r.is_active)
+    total_rule_applications = sum(r.applications_count for r in env.email_rules)
+    
+    return {
+        "email_stats": {
+            "total": total_emails,
+            "processed": processed_emails,
+            "spam": spam_emails,
+            "flagged": flagged_emails,
+            "processing_rate": processed_emails / total_emails if total_emails > 0 else 0
+        },
+        "action_stats": {
+            "replied": replied_emails,
+            "forwarded": forwarded_emails,
+            "actions_taken": env.metrics.actions_taken
+        },
+        "performance_stats": {
+            "avg_response_time_ms": avg_processing_time,
+            "total_requests": env.metrics.total_requests,
+            "sla_violations": env.metrics.sla_violations
+        },
+        "automation_stats": {
+            "active_rules": active_rules,
+            "rule_applications": total_rule_applications,
+            "tags_used": len(env.tags_used)
+        },
+        "team_stats": {
+            "members": len(env.team_members),
+            "audit_entries": len(env.audit_log)
+        }
+    }
+
