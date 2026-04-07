@@ -16,9 +16,27 @@ Required environment variables:
 
 import os
 import sys
+import subprocess
 import json
 import re
 from typing import Any, Dict, List, Optional
+
+# Auto-install dependencies if not present
+def ensure_dependencies():
+    """Ensure required dependencies are installed."""
+    required = ["openai", "httpx"]
+    missing = []
+    for pkg in required:
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing.append(pkg)
+    
+    if missing:
+        print(f"Installing missing dependencies: {missing}", file=sys.stderr)
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + missing)
+
+ensure_dependencies()
 
 import httpx
 from openai import OpenAI
