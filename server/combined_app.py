@@ -51,10 +51,11 @@ def list_tasks():
         return {"error": str(e)}
 
 @fastapi_app.post("/reset")
-def reset(request: ResetRequest):
+def reset(request: Optional[ResetRequest] = None):
     global api_env
     try:
-        api_env = EmailTriageEnv(task_id=request.task_id)
+        task_id = request.task_id if request else "task_easy_categorize"
+        api_env = EmailTriageEnv(task_id=task_id)
         result = api_env.reset()
         return {
             "observation": result.observation.model_dump(),
